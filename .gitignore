@@ -1,0 +1,42 @@
+# ---- Signing secrets: must never be committed ----
+keystore/
+keystore.properties
+*.jks
+*.keystore
+*.p12
+
+# ---- Machine-specific settings (sdk.dir contains your user name) ----
+local.properties
+
+# ---- MediaTek NeuroPilot runtime (bundled flavor only) ----
+# MediaTek's licence does not allow sharing this library on its own, so it stays out of the
+# repository. To build the "bundled" flavor, put libneuronusdk_adapter.mtk.so here yourself.
+app/src/bundled/jniLibs/
+
+# ---- Build outputs ----
+.gradle/
+.kotlin/
+build/
+**/build/
+.cxx/
+.externalNativeBuild/
+captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.idsig
+
+# ---- Models and test outputs (multi-GB, downloaded separately) ----
+*.onnx_data
+*.safetensors
+*.ckpt
+
+# ---- IDE and OS files ----
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+*.hprof
+hs_err_pid*.log
+replay_pid*.log

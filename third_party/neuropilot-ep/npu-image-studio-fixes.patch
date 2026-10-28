@@ -1,0 +1,568 @@
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/helper.cc nps/src/neuron_plugin_ep/neuron_impl/builders/helper.cc
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/helper.cc	2026-10-16 10:24:09.426410000 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/builders/helper.cc	2026-10-17 16:44:20.036718500 +0530
+@@ -498,7 +498,7 @@
+     return NeuronStatus(NeuronStatusCode::FAIL, "Failed to open dla file.");
+   }
+ 
+-  LOGS_NEURON(ERROR) << "WriteBinaryStringToFile: " << bin_file << ".";
++  LOGS_NEURON(VERBOSE) << "WriteBinaryStringToFile: " << bin_file << ".";  // (was ERROR; it is a success message)
+   output.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+   output.close();
+   return NeuronStatus::OK();
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/neuron_model_builder.cc nps/src/neuron_plugin_ep/neuron_impl/builders/neuron_model_builder.cc
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/neuron_model_builder.cc	2026-10-16 10:24:09.431409300 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/builders/neuron_model_builder.cc	2026-10-17 15:01:49.380192900 +0530
+@@ -134,6 +134,7 @@
+ void ModelBuilder::PreprocessInitializers() {
+   const auto& op_builders = GetOpBuilders();
+   for (const auto& node : ctx_.graph.node()) {
++    current_node_ = node.name() + " (" + node.op_type() + ")";
+     const auto it = op_builders.find(node.op_type());
+     if (it != op_builders.end()) {
+       skip_claim_node_ = &node;
+@@ -730,6 +731,8 @@
+       "op = " + std::to_string(op));
+ 
+   num_neuron_ops_++;
++  op_debug_.push_back(std::string(NeuronOperationTypeToStr(op)) + " <- " + current_node_ +
++                      (output_names.empty() ? std::string() : " out " + Shape2String(shaper_[output_names[0]])));
+   LOGS_NEURON(VERBOSE) << "Added Neuron Operation [" << NeuronOperationTypeToStr(op) << "]"
+                        << " inputs: " << Shape2String(input_indices)
+                        << " outputs: " << Shape2String(output_indices);
+@@ -1309,11 +1312,19 @@
+                             supported_ops_holder.get() + num_neuron_ops_,
+                             [](bool s) { return s; });
+   if (!all_ok) {
++    std::string rejected;
++    int shown = 0;
++    for (size_t i = 0; i < num_neuron_ops_; ++i) {
++      if (supported_ops_holder[i]) continue;
++      const std::string what = i < op_debug_.size() ? op_debug_[i] : std::to_string(i);
++      LOGS_NEURON(WARNING) << "Neuron devices reject op #" << i << ": " << what;
++      if (shown++ < 3) rejected += (rejected.empty() ? "" : "; ") + what;
++    }
+     LOGS_NEURON(VERBOSE) << "Some ops not supported by target devices: "
+                          << GetDevicesDescription(neuron_target_devices_);
+     return NeuronStatus{false, MakeNeuronString(
+         "Some ops unsupported by devices: ",
+-        GetDevicesDescription(neuron_target_devices_))};
++        GetDevicesDescription(neuron_target_devices_), " rejected: ", rejected)};
+   }
+ 
+   device_support_validated_ = true;
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/neuron_model_builder.h nps/src/neuron_plugin_ep/neuron_impl/builders/neuron_model_builder.h
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/neuron_model_builder.h	2026-10-16 10:24:09.432410400 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/builders/neuron_model_builder.h	2026-10-17 16:12:14.417283800 +0530
+@@ -65,6 +65,7 @@
+   NeuronStatus RestoredFromAdapterFormattedDla(std::unique_ptr<neuron::wrapper::Model>& model);
+ 
+   // Add a Neuron operation.
++  void SetCurrentNode(const std::string& n) { current_node_ = n; }
+   NeuronStatus AddOperation(int op,
+                              const std::vector<uint32_t>& input_indices,
+                              const std::vector<std::string>& output_names,
+@@ -227,6 +228,8 @@
+   gsl::span<const wrapper::Device> neuron_target_devices_;
+   const neuron::wrapper::TargetDeviceOption target_device_option_;
+   size_t num_neuron_ops_ = 0;
++  std::vector<std::string> op_debug_;   // per Neuron op: "TYPE <- onnx node" (NPU Image Studio patch)
++  std::string current_node_;
+   uint32_t next_index_ = 0;
+ 
+   // false when no target devices were resolved, so Compile() stays device-agnostic
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/op_builder_helpers.cc nps/src/neuron_plugin_ep/neuron_impl/builders/op_builder_helpers.cc
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/op_builder_helpers.cc	2026-10-16 10:24:09.440409500 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/builders/op_builder_helpers.cc	2026-10-17 12:51:34.618055500 +0530
+@@ -955,7 +955,7 @@
+ }
+ 
+ NeuronStatus GetAxesForSqueezeAndUnSqueeze(ModelBuilder& model_builder, const onnx::NodeProto& node,
+-                                           const NeuronGraphContext& /*ctx*/,
++                                           const NeuronGraphContext& ctx,
+                                            std::vector<int32_t>& axes) {
+   // Opset 13+ stores axes in input[1] (an INT64 initializer).
+   // Opset < 13 stores axes in the "axes" attribute; input[1] is absent/empty.
+@@ -967,12 +967,14 @@
+     // we leave axes empty (squeeze all dims of size 1).
+     const auto& initializers(model_builder.GetInitializerTensors());
+     const auto& axes_name = node.input(1);
+-    if (initializers.count(axes_name)) {
+-      const auto& axes_tensor = *initializers.at(axes_name);
+-      std::vector<int64_t> raw_axes;
+-      for (auto v : axes_tensor.int64_data()) raw_axes.push_back(v);
+-      axes = OnnxAxesToNeuron(gsl::make_span(raw_axes), std::nullopt);
+-    }
++    const onnx::TensorProto* axes_tensor = nullptr;
++    if (initializers.count(axes_name)) axes_tensor = initializers.at(axes_name);
++    if (!axes_tensor) axes_tensor = ctx.GetInitializer(axes_name);
++    NEURON_RETURN_IF_NOT(axes_tensor != nullptr, node.op_type(), ": axes input '", axes_name,
++                         "' must be a constant initializer");
++    std::vector<int64_t> raw_axes;
++    NEURON_RETURN_IF_ERROR(NeuronGraphContext::GetInt64Data(*axes_tensor, raw_axes));  // raw_data or int64_data
++    axes = OnnxAxesToNeuron(gsl::make_span(raw_axes), std::nullopt);
+   } else {
+     // Opset < 13: axes from the "axes" attribute.
+     for (const auto& attr : node.attribute()) {
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/op_impl/base_op_builder.cc nps/src/neuron_plugin_ep/neuron_impl/builders/op_impl/base_op_builder.cc
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/op_impl/base_op_builder.cc	2026-10-16 10:24:09.445414800 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/builders/op_impl/base_op_builder.cc	2026-10-17 16:12:14.415272100 +0530
+@@ -31,7 +31,15 @@
+ NeuronStatus BaseOpBuilder::AddToModelBuilder(ModelBuilder& model_builder,
+                                                const onnx::NodeProto& node,
+                                                const NeuronGraphContext& ctx) const {
+-  NEURON_RETURN_IF_ERROR(AddToModelBuilderImpl(model_builder, node, ctx));
++  model_builder.SetCurrentNode(node.name() + " (" + node.op_type() + ")");
++  {
++    auto st = AddToModelBuilderImpl(model_builder, node, ctx);
++    if (!st.IsOK()) {
++      LOGS_NEURON(ERROR) << "Building node [" << node.name() << "] type [" << node.op_type()
++                         << "] failed: " << st.msg_;
++      return NeuronStatus{false, st.msg_ + " (node '" + node.name() + "', " + node.op_type() + ")"};
++    }
++  }
+   LOGS_NEURON(VERBOSE) << "Operator name: [" << node.name()
+                         << "] type: [" << node.op_type() << "] was added";
+   return NeuronStatus::OK();
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/op_impl/gemm_op_builder.cc nps/src/neuron_plugin_ep/neuron_impl/builders/op_impl/gemm_op_builder.cc
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/op_impl/gemm_op_builder.cc	2026-10-16 10:24:09.458955400 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/builders/op_impl/gemm_op_builder.cc	2026-10-17 16:20:50.421275200 +0530
+@@ -240,8 +240,10 @@
+ 
+   uint32_t bias_idx;
+   const bool has_bias = node.input_size() > 2 && !node.input(2).empty();
++  // NPU Image Studio patch: a non-constant C cannot be an FC bias on MDLA.
++  const bool runtime_bias = has_bias && !is_quant_gemm && ctx.GetInitializer(node.input(2)) == nullptr;
+ 
+-  if (has_bias) {
++  if (has_bias && !runtime_bias) {
+     const auto& bias = node.input(2);
+     if (!is_quant_gemm) {
+       // Squeeze bias to 1-D if necessary.
+@@ -308,7 +310,9 @@
+     LOGS_NEURON(VERBOSE) << "Use FullyConnected with zero bias for node: " << node.name();
+     std::string bias = model_builder.GetUniqueName(node.name() + node.op_type() + "_bias");
+     const auto& bias_type = operand_types.at(actual_b_name).type;
+-    const Shape& bias_dimen = {shaper[actual_b_name][0]};
++    // NPU Image Studio patch: the bias length is the number of output units (last dim of Y). Using
++    // B's dim 0 is wrong when transB=0 (B is [K, N]) and made the whole Neuron model invalid.
++    const Shape& bias_dimen = {shaper[output].empty() ? shaper[actual_b_name][0] : shaper[output].back()};
+     if (bias_type == Type::TENSOR_FLOAT32) {
+       std::vector<float> buffer(bias_dimen[0], 0.f);
+       OperandType bias_operand_type(Type::TENSOR_FLOAT32, bias_dimen);
+@@ -328,7 +332,7 @@
+   input_indices.push_back(input_2_idx);                 // B
+   input_indices.push_back(bias_idx);                    // C
+   int32_t fuse_code = model_builder.FindActivation(node, ctx);
+-  ADD_SCALAR_OPERAND(model_builder, input_indices, fuse_code);
++  ADD_SCALAR_OPERAND(model_builder, input_indices, runtime_bias ? 0 : fuse_code);
+ 
+   // For QDQ, derive output type from the Q node's quant params, not the input type.
+   Type output_type = operand_types.at(input1).type;
+@@ -341,8 +345,19 @@
+     }
+   }
+   const OperandType output_operand_type(output_type, shaper[output], y_scale, y_zero_point);
+-  NEURON_RETURN_IF_ERROR(model_builder.AddOperation(NEURON_FULLY_CONNECTED, input_indices,
+-                                                     {output}, {output_operand_type}));
++  if (runtime_bias) {
++    const std::string fc_out = model_builder.GetUniqueName(node.name() + "_fc_nobias");
++    shaper.AddShape(fc_out, shaper[output]);
++    NEURON_RETURN_IF_ERROR(model_builder.AddOperation(NEURON_FULLY_CONNECTED, input_indices,
++                                                       {fc_out}, {output_operand_type}));
++    std::vector<uint32_t> add_inputs{operand_indices.at(fc_out), operand_indices.at(node.input(2))};
++    ADD_SCALAR_OPERAND(model_builder, add_inputs, fuse_code);
++    LOGS_NEURON(VERBOSE) << "Gemm [" << node.name() << "]: runtime C -> FULLY_CONNECTED + ADD";
++    NEURON_RETURN_IF_ERROR(model_builder.AddOperation(NEURON_ADD, add_inputs, {output}, {output_operand_type}));
++  } else {
++    NEURON_RETURN_IF_ERROR(model_builder.AddOperation(NEURON_FULLY_CONNECTED, input_indices,
++                                                       {output}, {output_operand_type}));
++  }
+   return NeuronStatus::OK();
+ }
+ 
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/op_impl/transpose_op_builder.cc nps/src/neuron_plugin_ep/neuron_impl/builders/op_impl/transpose_op_builder.cc
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/builders/op_impl/transpose_op_builder.cc	2026-10-16 10:24:09.481421200 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/builders/op_impl/transpose_op_builder.cc	2026-10-17 12:52:11.715729800 +0530
+@@ -65,15 +65,21 @@
+     if (squeezed > 0) {
+       for (int32_t i = 0; i < squeezed; i++)
+         NEURON_RETURN_IF_NOT(perm[static_cast<size_t>(i)] == i,
+-                              "Transpose: perm moves a squeezed leading unit dim");
++                              "Transpose: perm moves a squeezed leading unit dim: input '", input,
++                              "' builder-shape ", Shape2String(shaper[input]), " onnx-shape ",
++                              Shape2String(ctx.GetShape(input)), " perm-size ", perm_int64.size());
+       perm.erase(perm.begin(), perm.begin() + squeezed);
+       for (auto& v : perm) v -= squeezed;
+     }
+-    NEURON_RETURN_IF_NOT(static_cast<int32_t>(perm.size()) == input_dims,
+-                          "Perm and input should have the same number of dimensions");
++    if (static_cast<int32_t>(perm.size()) != input_dims) {
++      std::ostringstream os;
++      os << "Perm and input should have the same number of dimensions: input '" << input
++         << "' builder-shape " << Shape2String(shaper[input]) << " onnx-shape " << Shape2String(ctx.GetShape(input))
++         << " perm-size " << perm_int64.size();
++      return NeuronStatus{false, os.str()};
++    }
+   }
+ 
+-  (void)ctx;  // ctx not needed for non-quantized path
+ 
+   std::string perm_name = model_builder.GetUniqueName(node.name() + input + "perm");
+   NEURON_RETURN_IF_ERROR(
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_execution_provider_wrapper.cc nps/src/neuron_plugin_ep/neuron_impl/neuron_execution_provider_wrapper.cc
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_execution_provider_wrapper.cc	2026-10-16 10:24:09.487618400 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/neuron_execution_provider_wrapper.cc	2026-10-17 20:26:49.889231200 +0530
+@@ -33,6 +33,8 @@
+ #include <cstring>
+ #include <cstdint>
+ #include <filesystem>
++#include <mutex>
++#include <sstream>
+ #include <system_error>
+ #include <memory>
+ #include <sstream>
+@@ -127,6 +129,40 @@
+ // every inference call.  Caches all static metadata so ComputeImpl does zero
+ // heap allocations and zero ORT type-query calls per inference.
+ // ============================================================================
++// Page-aligned host buffer (some accelerator paths need aligned user buffers).
++struct AlignedBuffer {
++  void* data{nullptr};
++  size_t size{0};
++  AlignedBuffer() = default;
++  AlignedBuffer(const AlignedBuffer&) = delete;
++  AlignedBuffer& operator=(const AlignedBuffer&) = delete;
++  AlignedBuffer(AlignedBuffer&& o) noexcept : data(o.data), size(o.size) { o.data = nullptr; o.size = 0; }
++  void Resize(size_t n) {
++    std::free(data);
++    data = nullptr;
++    size = 0;
++    if (n && posix_memalign(&data, 4096, (n + 4095) / 4096 * 4096) == 0) size = n;
++  }
++  ~AlignedBuffer() { std::free(data); }
++};
++
++// NEURON_EP_SHARED_IO=1: all networks pass their inputs/outputs through one process-wide page-aligned
++// buffer instead of ORT's own tensors (padded to the size the compiled network expects). An experiment
++// for the NEURON_BAD_DATA refusals of the SD 1.5 UNet at 320x320 and up on the X200T; it did not change
++// them, so it is off by default.
++static bool SharedIoEnabled() {
++  static const bool enabled = [] {
++    const char* v = std::getenv("NEURON_EP_SHARED_IO");
++    return v != nullptr && std::strcmp(v, "1") == 0;
++  }();
++  return enabled;
++}
++static std::mutex g_shared_io_mutex;
++static AlignedBuffer g_shared_io;
++static size_t g_shared_io_needed = 0;  // largest io_total of any network, guarded by the mutex
++
++static size_t RoundUp4k(size_t n) { return (n + 4095) / 4096 * 4096; }
++
+ struct NeuronComputeState {
+   std::unique_ptr<neuron::wrapper::Execution> execution;
+ 
+@@ -134,12 +170,18 @@
+     size_t ort_idx;    // which ORT input slot maps to this model input
+     size_t byte_size;  // pre-computed, constant for static shapes
+     int synth_kind{-1};  // wrapper::Model::SynthInput::Kind, or -1 for a real input
++    size_t io_len{0};    // buffer length the compiled network expects (>= byte_size if padded)
++    size_t offset{0};    // position in the shared I/O buffer
+   };
+   struct OutputInfo {
+     size_t ort_idx;
+     size_t byte_size;
+     std::vector<int64_t> shape_i64;  // pre-built for ctx.GetOutput(); empty for scalars
++    size_t io_len{0};
++    size_t offset{0};
++    void* ort_buffer{nullptr};       // this run's ORT output, filled from the shared buffer after compute
+   };
++  size_t io_total{0};  // bytes this network needs in the shared I/O buffer
+   std::vector<InputInfo>  input_infos;
+   std::vector<OutputInfo> output_infos;
+ 
+@@ -252,6 +294,15 @@
+         }
+       }
+       if (!synth) info.ort_idx = model->GetMappedInputIdx(name);
++      const size_t padded = model->GetInputPaddedSize(i);
++      info.io_len = std::max(info.byte_size, padded);
++      if (padded > info.byte_size)
++        LOGS_NEURON(INFO) << "NeuronEP: input '" << name << "' needs a padded buffer: "
++                          << padded << " bytes for a " << info.byte_size << "-byte tensor";
++      if (!synth) {
++        info.offset = cs->io_total;
++        cs->io_total += RoundUp4k(info.io_len);
++      }
+     }
+     if (!model->GetSynthInputs().empty()) {
+       const auto& seqlens = model->GetSeqlensInputName();
+@@ -276,6 +327,13 @@
+       }
+       cs->output_infos[i].ort_idx   = model->GetMappedOutputIdx(name);
+       cs->output_infos[i].byte_size = out_type.GetOperandBlobByteSize();
++      const size_t padded = model->GetOutputPaddedSize(i);
++      cs->output_infos[i].io_len = std::max(cs->output_infos[i].byte_size, padded);
++      if (padded > cs->output_infos[i].byte_size)
++        LOGS_NEURON(INFO) << "NeuronEP: output '" << name << "' needs a padded buffer: " << padded
++                          << " bytes for a " << cs->output_infos[i].byte_size << "-byte tensor";
++      cs->output_infos[i].offset = cs->io_total;
++      cs->io_total += RoundUp4k(cs->output_infos[i].io_len);
+       // Build the int64 shape vector once; leave empty for scalar outputs.
+       if (!model->IsScalarOutput(name)) {
+         const auto& dims = out_type.dimensions;
+@@ -289,6 +347,11 @@
+       }
+     }
+ 
++    {
++      std::lock_guard<std::mutex> lock(g_shared_io_mutex);
++      g_shared_io_needed = std::max(g_shared_io_needed, cs->io_total);
++    }
++
+     *out_state = cs;
+     return nullptr;
+   }
+@@ -317,40 +380,90 @@
+       }
+     }
+ 
++    const bool shared = SharedIoEnabled();
++    std::unique_lock<std::mutex> io_lock(g_shared_io_mutex, std::defer_lock);
++    uint8_t* io = nullptr;
++    if (shared) {
++      io_lock.lock();
++      if (g_shared_io.size < g_shared_io_needed) {
++        g_shared_io.Resize(g_shared_io_needed);
++        if (!g_shared_io.size)
++          return self->ort_api->CreateStatus(ORT_EP_FAIL, "NeuronEP: could not allocate the shared I/O buffer");
++        LOGS_NEURON(INFO) << "NeuronEP: shared I/O buffer " << g_shared_io.size << " bytes";
++      }
++      io = static_cast<uint8_t*>(g_shared_io.data);
++    }
++
+     // Set inputs — no allocations, no type queries.
+     for (size_t i = 0; i < cs->input_infos.size(); ++i) {
+       const auto& info = cs->input_infos[i];
+       const void* buf = (info.synth_kind >= 0)
+                             ? static_cast<const void*>(cs->synth_buffers[i].data())
+                             : ctx.GetInput(info.ort_idx).GetTensorRawData();
+-      auto ns = cs->execution->SetInputFast(static_cast<int32_t>(i), buf, info.byte_size);
++      size_t len = info.byte_size;
++      if (shared && info.synth_kind < 0) {
++        std::memcpy(io + info.offset, buf, info.byte_size);
++        buf = io + info.offset;
++        len = info.io_len;
++      }
++      auto ns = cs->execution->SetInputFast(static_cast<int32_t>(i), buf, len);
+       if (!ns.IsOK())
+-        return self->ort_api->CreateStatus(ORT_EP_FAIL, ns.ErrorMessage().c_str());
++        return RunError(self, cs, ns, "NeuronExecution_setInput", i, len, true);
+     }
+ 
+-    // Set outputs — pre-built shapes, no copies.
++    // Set outputs — pre-built shapes.
+     for (size_t i = 0; i < cs->output_infos.size(); ++i) {
+-      const auto& info = cs->output_infos[i];
++      auto& info = cs->output_infos[i];
+       auto ort_out = ctx.GetOutput(info.ort_idx,
+                                    info.shape_i64.data(),
+                                    info.shape_i64.size());
+       // GetTensorMutableData<uint8_t>() is a type-agnostic raw-pointer accessor;
+       // the template parameter is irrelevant — the underlying C API returns void*.
+       void* buf = ort_out.GetTensorMutableData<uint8_t>();
++      size_t len = info.byte_size;
++      if (shared) {
++        info.ort_buffer = buf;
++        buf = io + info.offset;
++        len = info.io_len;
++      }
+       auto ns = cs->execution->SetOutputFast(
+-          static_cast<int32_t>(i), buf, info.byte_size);
++          static_cast<int32_t>(i), buf, len);
+       if (!ns.IsOK())
+-        return self->ort_api->CreateStatus(ORT_EP_FAIL, ns.ErrorMessage().c_str());
++        return RunError(self, cs, ns, "NeuronExecution_setOutput", i, len, false);
+     }
+ 
+     {
+       auto ns = cs->execution->Predict();
+       if (!ns.IsOK())
+-        return self->ort_api->CreateStatus(ORT_EP_FAIL, ns.ErrorMessage().c_str());
++        return RunError(self, cs, ns, "NeuronExecution_compute", SIZE_MAX, 0, false);
+     }
++    if (shared)
++      for (const auto& info : cs->output_infos) std::memcpy(info.ort_buffer, io + info.offset, info.byte_size);
+     return nullptr;
+   }
+ 
++  // Names the failing call and tensor, and lists the network's inputs/outputs with their byte sizes.
++  static OrtStatus* RunError(NeuronNodeComputeInfo* self, NeuronComputeState* cs, const NeuronStatus& ns,
++                             const char* call, size_t index, size_t bytes, bool is_input) {
++    std::ostringstream msg;
++    msg << ns.ErrorMessage() << " in " << call;
++    if (index != SIZE_MAX) {
++      const auto& names = is_input ? cs->model->GetInputs() : cs->model->GetOutputs();
++      msg << " #" << index << " '" << (index < names.size() ? names[index] : std::string("?"))
++          << "' (" << bytes << " bytes)";
++    }
++    msg << "; inputs:";
++    for (size_t i = 0; i < cs->input_infos.size(); ++i)
++      msg << " " << cs->model->GetInputs()[i] << "=" << cs->input_infos[i].byte_size
++          << "/padded " << cs->model->GetInputPaddedSize(i);
++    msg << "; outputs:";
++    for (size_t i = 0; i < cs->output_infos.size(); ++i)
++      msg << " " << cs->model->GetOutputs()[i] << "=" << cs->output_infos[i].byte_size
++          << "/padded " << cs->model->GetOutputPaddedSize(i);
++    LOGS_NEURON(ERROR) << "NeuronEP run failed: " << msg.str();
++    return self->ort_api->CreateStatus(ORT_EP_FAIL, msg.str().c_str());
++  }
++
+   static void ORT_API_CALL ReleaseStateImpl(OrtNodeComputeInfo* /*this_ptr*/,
+                                              void* state_ptr) {
+     delete static_cast<NeuronComputeState*>(state_ptr);
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_implementation.cc nps/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_implementation.cc
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_implementation.cc	2026-10-16 10:24:09.493628000 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_implementation.cc	2026-10-17 19:36:05.551854900 +0530
+@@ -197,6 +197,10 @@
+   LOAD_FUNCTION_OPTIONAL(libneuron_adapter,
+                          NeuronCompilation_getCompiledNetworkSize, neuron_api);
+   LOAD_FUNCTION_OPTIONAL(libneuron_adapter,
++                         NeuronCompilation_getInputPaddedSize, neuron_api);
++  LOAD_FUNCTION_OPTIONAL(libneuron_adapter,
++                         NeuronCompilation_getOutputPaddedSize, neuron_api);
++  LOAD_FUNCTION_OPTIONAL(libneuron_adapter,
+                          NeuronCompilation_storeCompiledNetwork, neuron_api);
+   LOAD_FUNCTION_OPTIONAL(libneuron_adapter,
+                          NeuronCompilation_setOptimizationHint, neuron_api);
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_implementation.h nps/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_implementation.h
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_implementation.h	2026-10-16 10:24:09.494638800 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_implementation.h	2026-10-17 19:36:05.550858700 +0530
+@@ -158,6 +158,10 @@
+   int (*NeuronCompilation_setPriority)(NeuronCompilation* compilation,
+                                        int priority);
+   // Get the compiled network size of the compilation.
++  // Optional (nullptr if the runtime lacks them).
++  int (*NeuronCompilation_getInputPaddedSize)(NeuronCompilation* compilation, int32_t index, size_t* size);
++  int (*NeuronCompilation_getOutputPaddedSize)(NeuronCompilation* compilation, int32_t index, size_t* size);
++
+   int (*NeuronCompilation_getCompiledNetworkSize)(
+       NeuronCompilation* compilation, size_t* size);
+ 
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_types.h nps/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_types.h
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_types.h	2026-10-16 10:24:09.495643100 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_types.h	2026-10-17 19:36:05.533970900 +0530
+@@ -509,6 +509,10 @@
+                                                 int32_t priority);
+ 
+ // Get the compiled network size of the compilation.
++// Expected (hardware-padded) I/O buffer sizes after NeuronCompilation_finish. Since Neuron 4.2.
++typedef int (*NeuronCompilation_getInputPaddedSize_fn)(NeuronCompilation* compilation, int32_t index, size_t* size);
++typedef int (*NeuronCompilation_getOutputPaddedSize_fn)(NeuronCompilation* compilation, int32_t index, size_t* size);
++
+ typedef int (*NeuronCompilation_getCompiledNetworkSize_fn)(
+     NeuronCompilation* compilation, size_t* size);
+ 
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_wrapper_model.cc nps/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_wrapper_model.cc
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_wrapper_model.cc	2026-10-16 10:24:09.498639400 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_wrapper_model.cc	2026-10-17 19:36:05.554864500 +0530
+@@ -61,6 +61,22 @@
+   return output_names_;
+ }
+ 
++size_t Model::GetInputPaddedSize(size_t index) const {
++  size_t size = 0;
++  if (compilation_ == nullptr || neuron_.NeuronCompilation_getInputPaddedSize == nullptr ||
++      neuron_.NeuronCompilation_getInputPaddedSize(compilation_, static_cast<int32_t>(index), &size) != NEURON_NO_ERROR)
++    return 0;
++  return size;
++}
++
++size_t Model::GetOutputPaddedSize(size_t index) const {
++  size_t size = 0;
++  if (compilation_ == nullptr || neuron_.NeuronCompilation_getOutputPaddedSize == nullptr ||
++      neuron_.NeuronCompilation_getOutputPaddedSize(compilation_, static_cast<int32_t>(index), &size) != NEURON_NO_ERROR)
++    return 0;
++  return size;
++}
++
+ const neuron::wrapper::OperandType& Model::GetInputType(const std::string& name) const {
+   return operand_types_.at(name);
+ }
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_wrapper_model.h nps/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_wrapper_model.h
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_wrapper_model.h	2026-10-16 10:24:09.499637900 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/neuron_lib/neuron_wrapper_model.h	2026-10-17 19:36:05.553861800 +0530
+@@ -71,6 +71,11 @@
+   const std::vector<std::string>& GetInputs() const;
+   const std::vector<std::string>& GetOutputs() const;
+ 
++  // Buffer size the compiled network expects for input/output `index` (it can be larger than the
++  // tensor when the accelerator pads it). 0 if unknown.
++  size_t GetInputPaddedSize(size_t index) const;
++  size_t GetOutputPaddedSize(size_t index) const;
++
+   // The GroupQueryAttention lowering needs position-dependent vectors (rotary
+   // rows, KV-write selectors, the causal mask) that nothing on the NPU can
+   // derive from seqlens_k (no GATHER / CAST / int32 compute on MDLA).  The
+diff -ruN --strip-trailing-cr npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_types_internal.h nps/src/neuron_plugin_ep/neuron_impl/neuron_types_internal.h
+--- npu-studio-work/vendor/ep-src/src/src/neuron_plugin_ep/neuron_impl/neuron_types_internal.h	2026-10-16 10:24:09.503815300 +0530
++++ nps/src/neuron_plugin_ep/neuron_impl/neuron_types_internal.h	2026-10-17 13:14:29.389871900 +0530
+@@ -14,6 +14,12 @@
+ #pragma once
+ 
+ #include <functional>
++#include <cstdlib>
++#include <cstdio>
++#include <mutex>
++#ifdef __ANDROID__
++#include <android/log.h>
++#endif
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
+@@ -169,9 +175,18 @@
+   bool active_;
+   std::ostringstream ss_;
+ 
++  // Runtime threshold (NPU Image Studio patch): NEURON_EP_LOG_LEVEL env var, default INFO.
++  static int RuntimeMinSeverity() {
++    static const int level = [] {
++      const char* v = std::getenv("NEURON_EP_LOG_LEVEL");
++      return (v && *v) ? std::atoi(v) : NEURON_LOG_SEVERITY_INFO;
++    }();
++    return level;
++  }
++
+   NeuronLogStream(int severity, const char* tag)
+       : severity_(severity),
+-        active_(severity >= NEURON_LOG_MIN_SEVERITY) {
++        active_(severity >= NEURON_LOG_MIN_SEVERITY && severity >= RuntimeMinSeverity()) {
+     if (active_) ss_ << "[" << tag << "] ";
+   }
+ 
+@@ -188,6 +203,24 @@
+                       : (severity_ >= NEURON_LOG_SEVERITY_INFO)    ? "INFO "
+                                                                     : "VERB ";
+       std::fprintf(stderr, "[NeuronEP][%s] %s\n", sev, ss_.str().c_str());
++#ifdef __ANDROID__
++      const int prio = (severity_ >= NEURON_LOG_SEVERITY_ERROR)   ? ANDROID_LOG_ERROR
++                     : (severity_ >= NEURON_LOG_SEVERITY_WARNING) ? ANDROID_LOG_WARN
++                     : (severity_ >= NEURON_LOG_SEVERITY_INFO)    ? ANDROID_LOG_INFO
++                                                                   : ANDROID_LOG_DEBUG;
++      // Detailed (verbose) lines go to the log file only: vivo mutes apps that flood logcat.
++      if (severity_ >= NEURON_LOG_SEVERITY_INFO) __android_log_print(prio, "NeuronEP", "%s", ss_.str().c_str());
++#endif
++      static std::FILE* log_file = [] {
++        const char* path = std::getenv("NEURON_EP_LOG_FILE");
++        return (path && *path) ? std::fopen(path, "a") : nullptr;
++      }();
++      if (log_file) {
++        static std::mutex log_mu;
++        std::lock_guard<std::mutex> lock(log_mu);
++        std::fprintf(log_file, "[%s] %s\n", sev, ss_.str().c_str());
++        std::fflush(log_file);
++      }
+     }
+   }
+ };
